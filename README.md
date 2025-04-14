@@ -16,7 +16,7 @@ A Python package for helping with detecting exoplanet transit dips in TESS light
 ## 📦 Installation
 
 ```bash
-pip install exoplanet_finder
+pip install TESSify
 ```
 
 ---
@@ -75,3 +75,53 @@ a.restore("Project1")
 a.process(100)
 #Enter the amount of files to process (It cannot be greater than the ones you have downloaded)
 ```
+
+Finalising the LightCurves and watching out for Transit Dips
+
+```python
+#After you have processed the files, you can see their graphs to see if there are any dips that would indicate the esistence of an exoplanet
+
+from TESSify import Project
+
+a = Project()
+
+a.restore("Project1")
+
+a.finalise(100)
+#Enter the amount of files to finalise (It cannot be greater than the ones you have processed)
+#This would open a window which you can navigate by:
+# "Right Keyboard Button" - Next Slide
+# "Left Keyboard Button" - Previous Slide
+# "Down Keyboard Button" - Shortlist Slide (If you see something of interest)
+# "Escape Button" - Exit Program
+```
+
+Getting the List of the Shortlisted Entities
+
+```python
+#After Shortlisting several potential candidates, you might want them in a list format
+
+from TESSify import Project
+
+a = Project()
+
+a.restore("Project1")
+
+finalised_list = a.getresults()
+# This returns a list in the TIC + ID format
+
+print(finalised_list)
+```
+
+---
+## 🧠 Contributing
+Contributions are welcome! Open an issue or submit a pull request at `https://github.com/arpit290/TESSify`
+
+---
+## 📜 License
+This project is licensed under the MIT License. See `LICENSE` for details.
+
+---
+## 👤 Author
+Arpit Bishnoi
+`https://github.com/arpit290` · `bishnoiarpit29@gmail.com`
