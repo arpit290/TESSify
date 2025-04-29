@@ -113,6 +113,22 @@ finalised_list = a.getresults()
 print(finalised_list)
 ```
 
+Saving the Shortlisted Entities as a JSON file
+
+```python
+#You want to save the shortlisted entities in a JSON
+from TESSify import Project
+
+a = Project()
+
+a.restore("Project1")
+
+filepath = "Your file path"
+#Enter the path to your file along with your filename and extension EX:- C:\Users\Expert\Documents\Programming\address.json
+
+a.saveresults(filepath)
+```
+
 ---
 ## 🧠 Contributing
 Contributions are welcome! Open an issue or submit a pull request at `https://github.com/arpit290/TESSify`
