@@ -17,6 +17,7 @@ class Project():
         chdir(name)
         self.cpath = getcwd()
         self.setup()
+        print(f"Successfully created {name}!!")
     
     def restore(self, name):
         self.name = name
@@ -25,6 +26,7 @@ class Project():
         self.config_file = open(r"config.json", "r")
         self.config = loads(self.config_file.read())
         self.config_file.close()
+        print(f"Successfully restored {name}!!")
 
     def setup(self):
         makedirs(r"LightCurves")
@@ -172,3 +174,9 @@ class Project():
         for x in set(self.config["Finalising_Progress"]["List"]):
             finallist.append("TIC "+x.split("-")[2].lstrip("0"))
         return finallist
+    
+    def saveresults(self, name):
+        fw = open(name, 'w')
+        fw.write(dumps(self.getresults()))
+        fw.close()
+        
