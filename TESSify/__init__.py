@@ -1,13 +1,19 @@
-"""TESS light-curve / target-pixel project manager.
+"""TESS light-curve / target-pixel project manager (needs Python 3.9+).
 
-Workflow:
-    p = Project(); p.create("my_project")        # or p.restore("my_project")
-    p.download("lc", "bulk_download.sh", 100)    # fetch files listed in a MAST curl script
-    p.process(100)                               # render a flattened plot for each file
-    p.finalise(100)                              # browse plots, press Down to mark candidates
-    p.saveresults("candidates.json")             # write the marked TIC IDs
+Typical workflow:
 
-Every step is resumable: progress is stored in <project>/config.json.
+    project = Project()
+    project.create("my_project")                  # or: project.restore("my_project")
+    project.download("lc", "bulk_download.sh", 100)
+    project.process(100)
+    project.finalise(100)                         # Down = mark, Up = unmark, Esc = quit
+    project.saveresults("candidates.json")
+
+Every stage is resumable: progress lives in <project>/config.json.
+
+Note: if you call process(..., workers=N) with N > 1 on Windows/macOS, put your
+script's top-level code under ``if __name__ == "__main__":`` (standard rule for
+multiprocessing).
 """
 from __future__ import annotations
 
@@ -17,68 +23,278 @@ import os
 import re
 import shlex
 import subprocess
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field, fields
+from functools import lru_cache, partial, wraps
 from pathlib import Path
+from typing import Callable, Iterable, Iterator
 
-DOWNLOAD_DIRS = {"lc": "LightCurves", "tp": "TargetPixels"}
+try:  # the viewer is optional, so headless machines can still download and process
+    import tkinter as tk
+    from PIL import Image, ImageTk
+except ImportError:
+    tk = None
+
+KIND_DIRS = {"lc": "LightCurves", "tp": "TargetPixels"}
+GRAPHS_DIR = "Graphs"
 CONFIG_NAME = "config.json"
 IMAGE_EXT = ".jpeg"
-_TIC_RE = re.compile(r"-s\d{4}-(\d{16})-")
+SAVE_EVERY = 25  # write config.json after this many completed files (and on exit)
+TIC_PATTERN = re.compile(r"-s\d{4}-(\d{16})-")
 
 
-def _default_config(name: str) -> dict:
-    return {
-        "Name": name,
-        "Download_Progress": {"Type": None, "Script": None, "ToDownload": None, "List": [], "Failed": []},
-        "Processing_Progress": {"ToProcess": None, "List": [], "Failed": []},
-        "Finalising_Progress": {"ToFinalise": None, "Finalised": 0, "List": []},
-    }
+# --------------------------------------------------------------------------- #
+# Small helpers
+# --------------------------------------------------------------------------- #
+def image_name(filename: str) -> str:
+    """'tess...-s0014-...-s_lc.fits' -> 'tess...-s0014-...-s_lc.jpeg'."""
+    return Path(filename).stem + IMAGE_EXT
 
 
-def _atomic_write_json(path: Path, data) -> None:
-    """Write JSON via a temp file so a crash can never leave a half-written config."""
+def tic_id(name: str) -> str | None:
+    """'tess...-s0014-0000000261136679-0150-s_lc.jpeg' -> 'TIC 261136679'."""
+    match = TIC_PATTERN.search(name)
+    if match is None:
+        return None
+    return "TIC " + (match.group(1).lstrip("0") or "0")
+
+
+def read_commands(script_path: str | Path, limit: int) -> dict[str, list[str]]:
+    """Parse the first `limit` curl commands of a MAST script into {output_file: argv}."""
+    commands: dict[str, list[str]] = {}
+    with open(script_path, "r", encoding="utf-8") as script:
+        for line in script:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if len(commands) == limit:
+                break
+            argv = shlex.split(line)
+            commands[_output_file(argv)] = argv
+    return commands
+
+
+def _output_file(argv: list[str]) -> str:
+    """Return the file name given to curl's -o / --output flag."""
+    for flag in ("-o", "--output"):
+        if flag in argv and argv.index(flag) + 1 < len(argv):
+            return Path(argv[argv.index(flag) + 1]).name
+    raise ValueError(f"No output file (-o) found in command: {' '.join(argv)}")
+
+
+def _write_json_atomically(path: Path, data: dict) -> None:
+    """Write via a temp file so a crash never leaves a half-written config."""
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     os.replace(tmp, path)
 
 
-def _tic_from_filename(name: str) -> str | None:
-    """'tess...-s0014-0000000261136679-0150-s_lc' -> 'TIC 261136679'."""
-    match = _TIC_RE.search(name)
-    if match is None:
-        parts = name.split("-")
-        digits = parts[2] if len(parts) > 2 else ""
-        if not digits.isdigit():
-            return None
-    else:
-        digits = match.group(1)
-    return "TIC " + (digits.lstrip("0") or "0")
+# --------------------------------------------------------------------------- #
+# Workers (module-level so they can be sent to other processes)
+# --------------------------------------------------------------------------- #
+def _download(filename: str, commands: dict[str, list[str]], cwd: Path) -> None:
+    result = subprocess.run(commands[filename], cwd=cwd)
+    if result.returncode != 0 or not (cwd / filename).is_file():
+        raise RuntimeError(f"download exited with code {result.returncode}")
 
 
-def _output_filename(tokens: list[str]) -> str:
-    """Extract the output file name from a curl command (the argument of -o / --output)."""
-    for flag in ("-o", "--output"):
-        if flag in tokens:
-            idx = tokens.index(flag)
-            if idx + 1 < len(tokens):
-                return tokens[idx + 1]
-    raise ValueError(f"Could not find an output file (-o) in command: {' '.join(tokens)}")
+def _render(filename: str, kind: str, source_dir: Path, graphs_dir: Path) -> None:
+    """Clean one FITS file and save its plot."""
+    import matplotlib
+    matplotlib.use("Agg")  # no GUI windows, no clash with the Tk viewer
+    import matplotlib.pyplot as plt
+    import lightkurve as lk
+
+    data = lk.read(source_dir / filename)
+    if kind == "tp":
+        data = data.to_lightcurve(aperture_mask="all")
+    lightcurve = data.remove_nans().flatten()
+
+    fig, ax = plt.subplots()
+    try:
+        lightcurve.plot(ax=ax)
+        fig.savefig(graphs_dir / image_name(filename), bbox_inches="tight")
+    finally:
+        plt.close(fig)
+        del data, lightcurve
+        gc.collect()
+
+
+def _run_jobs(job: Callable[[str], None], items: Iterable[str],
+              workers: int, executor_cls) -> Iterator[tuple[str, Exception | None]]:
+    """Run job(item) for every item, yielding (item, error_or_None) as each one finishes."""
+    if workers <= 1:  # inline: simpler tracebacks, no pool start-up cost
+        for item in items:
+            try:
+                job(item)
+                yield item, None
+            except Exception as error:
+                yield item, error
+        return
+
+    pool = executor_cls(max_workers=workers)
+    try:
+        futures = {pool.submit(job, item): item for item in items}
+        for future in as_completed(futures):
+            yield futures[future], future.exception()
+    finally:  # on Ctrl-C: let running jobs finish, drop the queued ones
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+# --------------------------------------------------------------------------- #
+# Project state (saved as config.json)
+# --------------------------------------------------------------------------- #
+@dataclass
+class State:
+    name: str
+    kind: str | None = None                 # "lc" or "tp"
+    script: str | None = None
+    downloaded: list[str] = field(default_factory=list)       # FITS file names
+    download_failed: list[str] = field(default_factory=list)
+    processed: list[str] = field(default_factory=list)        # image file names
+    process_failed: list[str] = field(default_factory=list)
+    reviewed: int = 0                       # how many processed images were viewed
+    marked: list[str] = field(default_factory=list)           # images flagged in the viewer
+
+    @classmethod
+    def load(cls, path: Path) -> State:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if "Download_Progress" in data:  # config written by the older versions
+            data = cls._from_legacy(data)
+        known = {f.name for f in fields(cls)}
+        return cls(**{key: value for key, value in data.items() if key in known})
+
+    @staticmethod
+    def _from_legacy(data: dict) -> dict:
+        download = data.get("Download_Progress", {})
+        process = data.get("Processing_Progress", {})
+        finalise = data.get("Finalising_Progress", {})
+        return {
+            "name": data.get("Name", ""),
+            "kind": download.get("Type"),
+            "script": download.get("Script"),
+            "downloaded": download.get("List", []),
+            "download_failed": download.get("Failed", []),
+            "processed": process.get("List", []),
+            "process_failed": process.get("Failed", []),
+            "reviewed": finalise.get("Finalised", 0),
+            "marked": finalise.get("List", []),
+        }
+
+
+# --------------------------------------------------------------------------- #
+# Image viewer
+# --------------------------------------------------------------------------- #
+class ImageReviewer:
+    """Tk window for stepping through plots.
+
+    Right/Left: navigate    Down: mark    Up: unmark    Esc or close: finish
+    """
+
+    def __init__(self, graphs_dir: Path, images: list[str],
+                 marked: list[str], on_change: Callable[[], None]):
+        if tk is None:
+            raise RuntimeError("The viewer needs tkinter and Pillow (pip install pillow).")
+        self.graphs_dir = graphs_dir
+        self.images = images
+        self.marked = marked          # shared with the project state, edited in place
+        self.on_change = on_change
+        self.index = 0
+        self.furthest = 0
+
+        self.root = tk.Tk()
+        self.max_size = (int(self.root.winfo_screenwidth() * 0.9),
+                         int(self.root.winfo_screenheight() * 0.85))
+        self.label = tk.Label(self.root)
+        self.label.pack()
+        self._load = lru_cache(maxsize=8)(self._read_photo)  # cheap back-and-forth browsing
+
+        keys = {
+            "Right": lambda: self._move(+1),
+            "Left": lambda: self._move(-1),
+            "Down": self._mark,
+            "Up": self._unmark,
+            "Escape": self.root.destroy,
+        }
+        self.root.bind("<Key>", lambda event: keys.get(event.keysym, lambda: None)())
+
+    def run(self) -> int:
+        """Block until the window closes; return how many images were reached."""
+        self._show()
+        self.root.mainloop()
+        return self.furthest + 1
+
+    def _read_photo(self, name: str):
+        with Image.open(self.graphs_dir / name) as img:
+            img.thumbnail(self.max_size)  # only ever shrinks
+            return ImageTk.PhotoImage(img)
+
+    def _show(self) -> None:
+        name = self.images[self.index]
+        flag = "  [MARKED]" if name in self.marked else ""
+        self.root.title(f"{self.index + 1}/{len(self.images)}  {name}{flag}")
+        try:
+            photo = self._load(name)
+        except OSError as error:
+            self.label.config(image="", text=f"Cannot open {name}: {error}")
+            return
+        self.label.config(image=photo, text="")
+        self.label.image = photo
+
+    def _move(self, step: int) -> None:
+        target = self.index + step
+        if 0 <= target < len(self.images):
+            self.index = target
+            self.furthest = max(self.furthest, target)
+            self._show()
+
+    def _mark(self) -> None:
+        name = self.images[self.index]
+        if name not in self.marked:
+            self.marked.append(name)
+            self.on_change()
+            print(f"Appended: {name}")
+            self._show()
+
+    def _unmark(self) -> None:
+        name = self.images[self.index]
+        if name in self.marked:
+            self.marked.remove(name)
+            self.on_change()
+            print(f"Removed: {name}")
+            self._show()
+
+
+# --------------------------------------------------------------------------- #
+# Project
+# --------------------------------------------------------------------------- #
+def needs_project(method):
+    """Raise a clear error if create()/restore() hasn't been called yet."""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if self.state is None:
+            raise RuntimeError("No project loaded: call create() or restore() first.")
+        return method(self, *args, **kwargs)
+    return wrapper
 
 
 class Project:
     def __init__(self):
-        self.name: str | None = None
         self.root: Path | None = None
-        self.config: dict | None = None
+        self.state: State | None = None
 
-    # ------------------------------------------------------------------ setup
+    @property
+    def name(self) -> str | None:
+        return self.state.name if self.state else None
+
+    # -- lifecycle ---------------------------------------------------------- #
     def create(self, name: str) -> None:
         self.root = Path(name).resolve()
-        self.root.mkdir(parents=True, exist_ok=False)  # refuse to clobber an existing project
-        for sub in (*DOWNLOAD_DIRS.values(), "Graphs"):
+        self.root.mkdir(parents=True, exist_ok=False)  # never overwrite an existing project
+        for sub in (*KIND_DIRS.values(), GRAPHS_DIR):
             (self.root / sub).mkdir()
-        self.name = name
-        self.config = _default_config(name)
-        self._save()
+        self.state = State(name=name)
+        self.save()
         print(f"Successfully created {name}!!")
 
     def restore(self, name: str) -> None:
@@ -86,208 +302,102 @@ class Project:
         config_path = root / CONFIG_NAME
         if not config_path.is_file():
             raise FileNotFoundError(f"No {CONFIG_NAME} found in {root}")
-        loaded = json.loads(config_path.read_text(encoding="utf-8"))
-        # Merge over defaults so configs from older versions still work.
-        config = _default_config(name)
-        for section, values in loaded.items():
-            if isinstance(values, dict) and isinstance(config.get(section), dict):
-                config[section].update(values)
-            else:
-                config[section] = values
-        self.root, self.name, self.config = root, name, config
+        self.root, self.state = root, State.load(config_path)
         print(f"Successfully restored {name}!!")
 
-    def _save(self) -> None:
-        self._require_project()
-        _atomic_write_json(self.root / CONFIG_NAME, self.config)
+    @needs_project
+    def save(self) -> None:
+        _write_json_atomically(self.root / CONFIG_NAME, asdict(self.state))
 
-    # Kept for backwards compatibility with the old public method name.
-    updateconfig = _save
+    updateconfig = save  # old name
 
-    def _require_project(self) -> None:
-        if self.root is None or self.config is None:
-            raise RuntimeError("No project loaded: call create() or restore() first.")
-
-    # --------------------------------------------------------------- download
-    def download(self, kind: str, script_path: str, amount: int) -> None:
-        """Run the first `amount` download commands of a curl script, skipping finished ones."""
-        self._require_project()
-        if kind not in DOWNLOAD_DIRS:
-            raise ValueError(f"kind must be one of {sorted(DOWNLOAD_DIRS)}, got {kind!r}")
-        progress = self.config["Download_Progress"]
-        if progress["Type"] not in (None, kind):
-            raise ValueError(f"This project already downloads {progress['Type']!r} files; "
+    # -- stage 1: download -------------------------------------------------- #
+    @needs_project
+    def download(self, kind: str, script_path: str, amount: int, workers: int = 4) -> None:
+        """Download the first `amount` files of a curl script (`workers` run in parallel)."""
+        if kind not in KIND_DIRS:
+            raise ValueError(f"kind must be one of {sorted(KIND_DIRS)}, got {kind!r}")
+        if self.state.kind not in (None, kind):
+            raise ValueError(f"This project holds {self.state.kind!r} files; "
                              "use a separate project for a different type.")
+        self.state.kind, self.state.script = kind, str(script_path)
 
-        with open(script_path, "r", encoding="utf-8") as script:
-            commands = [line.strip() for line in script
-                        if line.strip() and not line.lstrip().startswith("#")][:amount]
+        commands = read_commands(script_path, amount)
+        done = set(self.state.downloaded)
+        pending = [name for name in commands if name not in done]
+        job = partial(_download, commands=commands, cwd=self.root / KIND_DIRS[kind])
 
-        progress.update(Type=kind, Script=str(script_path), ToDownload=len(commands))
-        self._save()
+        self._run_stage(job, pending, total=len(commands), workers=workers,
+                        executor_cls=ThreadPoolExecutor,  # downloads wait on the network
+                        done=self.state.downloaded, failed=self.state.download_failed)
 
-        target = self.root / DOWNLOAD_DIRS[kind]
-        done = set(progress["List"])
-        try:
-            for number, command in enumerate(commands, start=1):
-                tokens = shlex.split(command)
-                filename = Path(_output_filename(tokens)).name
-                if filename in done:
-                    continue
-                result = subprocess.run(tokens, cwd=target)
-                if result.returncode != 0 or not (target / filename).is_file():
-                    print(f"{number}/{len(commands)} FAILED: {filename}")
-                    if filename not in progress["Failed"]:
-                        progress["Failed"].append(filename)
-                    continue
-                progress["List"].append(filename)
-                done.add(filename)
-                if filename in progress["Failed"]:
-                    progress["Failed"].remove(filename)
-                self._save()  # persist after every file so an interruption loses nothing
-                print(f"{number}/{len(commands)}")
-        finally:
-            self._save()
+    # -- stage 2: process --------------------------------------------------- #
+    @needs_project
+    def process(self, amount: int, workers: int = 1) -> None:
+        """Plot the first `amount` downloaded files (raise `workers` to use more CPU cores)."""
+        files = self.state.downloaded[:amount]
+        done = set(self.state.processed)
+        pending = [name for name in files if image_name(name) not in done]
+        job = partial(_render, kind=self.state.kind,
+                      source_dir=self.root / KIND_DIRS.get(self.state.kind, ""),
+                      graphs_dir=self.root / GRAPHS_DIR)
 
-    # ---------------------------------------------------------------- process
-    def process(self, amount: int) -> None:
-        """Render a plot for the first `amount` downloaded files, skipping finished ones."""
-        self._require_project()
-        progress = self.config["Processing_Progress"]
-        files = self.config["Download_Progress"]["List"][:amount]
-        progress["ToProcess"] = len(files)
-        done = set(progress["List"])
-        try:
-            for number, filename in enumerate(files, start=1):
-                image = Path(filename).stem + IMAGE_EXT
-                if image in done:
-                    continue
-                try:
-                    self.indprocess(filename)
-                except Exception as exc:  # one corrupt file shouldn't kill the whole batch
-                    print(f"{number}/{len(files)} FAILED: {filename} ({exc})")
-                    if filename not in progress["Failed"]:
-                        progress["Failed"].append(filename)
-                    continue
-                progress["List"].append(image)
-                done.add(image)
-                self._save()
-                print(f"{number}/{len(files)}")
-        finally:
-            self._save()
+        self._run_stage(job, pending, total=len(files), workers=workers,
+                        executor_cls=ProcessPoolExecutor,  # plotting is CPU-bound
+                        done=self.state.processed, failed=self.state.process_failed,
+                        record=image_name)
 
+    @needs_project
     def indprocess(self, filename: str) -> str:
-        """Clean one file, plot it and save the image. Returns the image file name."""
-        self._require_project()
-        import matplotlib
-        matplotlib.use("Agg")  # no GUI windows, and no clash with the Tk viewer
-        import matplotlib.pyplot as plt
-        import lightkurve as lk
+        """Plot a single downloaded file and return the image name."""
+        _render(filename, self.state.kind,
+                self.root / KIND_DIRS[self.state.kind], self.root / GRAPHS_DIR)
+        return image_name(filename)
 
-        kind = self.config["Download_Progress"]["Type"]
-        if kind not in DOWNLOAD_DIRS:
-            raise ValueError("Nothing has been downloaded yet.")
-        source = self.root / DOWNLOAD_DIRS[kind] / filename
-
-        data = lk.read(source)
-        if kind == "tp":
-            data = data.to_lightcurve(aperture_mask="all")
-        lc = data.remove_nans().flatten()
-
-        image = Path(filename).stem + IMAGE_EXT
-        fig, ax = plt.subplots()
-        try:
-            lc.plot(ax=ax)
-            fig.savefig(self.root / "Graphs" / image, bbox_inches="tight")
-        finally:
-            plt.close(fig)
-            del data, lc
-            gc.collect()
-        return image
-
-    # --------------------------------------------------------------- finalise
+    # -- stage 3: review ---------------------------------------------------- #
+    @needs_project
     def finalise(self, amount: int) -> None:
         """Open the viewer on the not-yet-reviewed images among the first `amount`."""
-        self._require_project()
-        progress = self.config["Finalising_Progress"]
-        images = self.config["Processing_Progress"]["List"][:amount]
-        progress["ToFinalise"] = len(images)
-        self._save()
-        self.indfinalise(images[progress["Finalised"]:], start=progress["Finalised"])
-
-    def indfinalise(self, image_paths: list[str], start: int = 0) -> None:
-        """Image viewer. Right/Left: navigate. Down: mark. Up: unmark. Esc/close: save and quit."""
-        self._require_project()
-        if not image_paths:
+        pending = self.state.processed[:amount][self.state.reviewed:]
+        if not pending:
             print("Nothing left to review.")
             return
+        reviewer = ImageReviewer(self.root / GRAPHS_DIR, pending, self.state.marked, self.save)
+        self.state.reviewed += reviewer.run()
+        self.save()
 
-        import tkinter as tk
-        from PIL import Image, ImageTk
-
-        progress = self.config["Finalising_Progress"]
-        graphs = self.root / "Graphs"
-        state = {"index": 0, "furthest": 0}
-
-        root = tk.Tk()
-        max_size = (int(root.winfo_screenwidth() * 0.9), int(root.winfo_screenheight() * 0.85))
-        label = tk.Label(root)
-        label.pack()
-
-        def show() -> None:
-            name = image_paths[state["index"]]
-            marked = "  [MARKED]" if name in progress["List"] else ""
-            root.title(f"{state['index'] + 1}/{len(image_paths)}  {name}{marked}")
-            try:
-                with Image.open(graphs / name) as img:
-                    img.thumbnail(max_size)
-                    photo = ImageTk.PhotoImage(img)
-                label.config(image=photo, text="")
-                label.image = photo  # keep a reference or Tk garbage-collects it
-            except OSError as exc:
-                label.config(image="", text=f"Cannot open {name}: {exc}")
-
-        def finish() -> None:
-            progress["Finalised"] = start + state["furthest"] + 1
-            self._save()
-            root.destroy()
-
-        def on_key(event) -> None:
-            if event.keysym == "Right" and state["index"] < len(image_paths) - 1:
-                state["index"] += 1
-                state["furthest"] = max(state["furthest"], state["index"])
-            elif event.keysym == "Left" and state["index"] > 0:
-                state["index"] -= 1
-            elif event.keysym == "Down":
-                name = image_paths[state["index"]]
-                if name not in progress["List"]:
-                    progress["List"].append(name)
-                    self._save()
-                    print(f"Appended: {name}")
-            elif event.keysym == "Up":
-                name = image_paths[state["index"]]
-                if name in progress["List"]:
-                    progress["List"].remove(name)
-                    self._save()
-                    print(f"Removed: {name}")
-            elif event.keysym == "Escape":
-                finish()
-                return
-            else:
-                return
-            show()
-
-        root.bind("<Key>", on_key)
-        root.protocol("WM_DELETE_WINDOW", finish)  # closing with the X also saves progress
-        show()
-        root.mainloop()
-
-    # ---------------------------------------------------------------- results
+    # -- results ------------------------------------------------------------ #
+    @needs_project
     def getresults(self) -> list[str]:
-        """Unique TIC IDs of all marked images, in the order they were marked."""
-        self._require_project()
-        tics = (_tic_from_filename(name) for name in self.config["Finalising_Progress"]["List"])
-        return list(dict.fromkeys(t for t in tics if t))
+        """Unique TIC IDs of the marked images, in the order they were marked."""
+        ids = (tic_id(name) for name in self.state.marked)
+        return list(dict.fromkeys(tic for tic in ids if tic))
 
     def saveresults(self, name: str) -> None:
         Path(name).write_text(json.dumps(self.getresults()), encoding="utf-8")
+
+    # -- shared stage runner ------------------------------------------------ #
+    def _run_stage(self, job, pending: list[str], *, total: int, workers: int, executor_cls,
+                   done: list[str], failed: list[str],
+                   record: Callable[[str], str] = lambda item: item) -> None:
+        """Run `job` over `pending`, tracking successes/failures and saving periodically."""
+        finished = total - len(pending)
+        unsaved = 0
+        try:
+            for item, error in _run_jobs(job, pending, workers, executor_cls):
+                finished += 1
+                if error is not None:
+                    print(f"{finished}/{total} FAILED: {item} ({error})")
+                    if item not in failed:
+                        failed.append(item)
+                    continue
+                done.append(record(item))
+                if item in failed:
+                    failed.remove(item)
+                print(f"{finished}/{total}")
+                unsaved += 1
+                if unsaved >= SAVE_EVERY:
+                    self.save()
+                    unsaved = 0
+        finally:
+            self.save()  # also runs on Ctrl-C, so nothing finished is lost

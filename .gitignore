@@ -1,1 +1,6 @@
 pyproject.toml 
+.venv
+test.py
+files
+my_project
+TESSify/__pycache__
