@@ -7,6 +7,7 @@ A Python package for helping with detecting exoplanet transit dips in TESS light
 
 - Load and clean `.fits` light curve or target pixel files
 - Visualize flattened light curves and shortlist transit candidates
+- Tune the flattening window and the pixel selection (`window_length`, `aperture_mask`) to suit your targets
 - Download and process data in bulk, with parallel downloads and optional multi-core processing
 - Resumable at every stage: stop at any time (even with Ctrl-C) and pick up where you left off
 - Failed downloads and plots are recorded and retried on the next run instead of crashing the batch
@@ -113,10 +114,29 @@ a.process(100, workers=4)
 
 Files that can't be read (for example, a corrupt download) are skipped, reported in the console, and listed under `process_failed` in `config.json`. Re-running `process` retries them.
 
-To process a single file and get the image name back:
+#### Customising the processing
+
+Two optional settings control how each file is cleaned:
 
 ```python
-image = a.indprocess("tess2019198215352-s0014-0000000261136679-0150-s_lc.fits")
+a.process(100, window_length=401, aperture_mask="pipeline")
+```
+
+| Setting | Default | Applies to | What it does |
+|---------|---------|------------|--------------|
+| `window_length` | `101` | `lc` and `tp` | Size, in data points, of the smoothing window `flatten()` uses to remove slow brightness drift. Must be an odd integer of 3 or more. |
+| `aperture_mask` | `"all"` | `tp` only | Which pixels are added together to build a light curve from a target pixel file. Ignored for `lc` files. |
+
+**`window_length`:** the flattening filter smooths away anything shorter than its window, and a transit is a short dip. At the default of 101 points (about 3.4 hours for 2-minute data), a long transit can be partly flattened away. Use a window several times longer than the transits you are looking for, for example `401` or `1001` for 2-minute data. If the window is too large, slow stellar variability stays in the curve; if it is too small, real dips get erased. Longer cadences (10 or 30 minutes) need fewer points to cover the same time span.
+
+**`aperture_mask`:** `"all"` adds up every pixel in the cutout, including faint, noisy ones. Other options are `"pipeline"` (the pixels chosen by the TESS mission pipeline, usually cleaner) and `"threshold"` (only pixels above a brightness threshold). If your target pixel plots look noisy, try `"pipeline"`.
+
+Files that already have a plot are skipped, so changing these settings only affects files processed afterwards. To re-plot everything with new settings, delete the images in `Graphs/`, then set `"processed"` to `[]` and `"reviewed"` to `0` in `config.json`. Your shortlist (`"marked"`) is kept.
+
+To process a single file and get the image name back (it accepts the same settings):
+
+```python
+image = a.indprocess("tess2019198215352-s0014-0000000261136679-0150-s_lc.fits", window_length=401)
 ```
 
 ### Finalising the light curves and watching out for transit dips

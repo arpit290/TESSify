@@ -40,6 +40,8 @@ GRAPHS_DIR = "Graphs"
 CONFIG_NAME = "config.json"
 IMAGE_EXT = ".jpeg"
 SAVE_EVERY = 25  # write config.json after this many completed files (and on exit)
+DEFAULT_WINDOW_LENGTH = 101      # lightkurve's own default for flatten()
+DEFAULT_APERTURE_MASK = "all"    # target pixel files only: which pixels form the light curve
 TIC_PATTERN = re.compile(r"-s\d{4}-(\d{16})-")
 
 
@@ -89,6 +91,12 @@ def _write_json_atomically(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
+def _check_window_length(window_length: int) -> None:
+    """flatten() needs an odd integer window of at least 3 points."""
+    if not isinstance(window_length, int) or window_length < 3 or window_length % 2 == 0:
+        raise ValueError(f"window_length must be an odd integer >= 3, got {window_length!r}")
+
+
 # --------------------------------------------------------------------------- #
 # Workers (module-level so they can be sent to other processes)
 # --------------------------------------------------------------------------- #
@@ -98,8 +106,14 @@ def _download(filename: str, commands: dict[str, list[str]], cwd: Path) -> None:
         raise RuntimeError(f"download exited with code {result.returncode}")
 
 
-def _render(filename: str, kind: str, source_dir: Path, graphs_dir: Path) -> None:
-    """Clean one FITS file and save its plot."""
+def _render(filename: str, kind: str, source_dir: Path, graphs_dir: Path,
+            window_length: int = DEFAULT_WINDOW_LENGTH,
+            aperture_mask: str = DEFAULT_APERTURE_MASK) -> None:
+    """Clean one FITS file and save its plot.
+
+    window_length: smoothing window (in data points) used by flatten().
+    aperture_mask: pixels summed into a light curve; only used for target pixel files.
+    """
     import matplotlib
     matplotlib.use("Agg")  # no GUI windows, no clash with the Tk viewer
     import matplotlib.pyplot as plt
@@ -107,8 +121,8 @@ def _render(filename: str, kind: str, source_dir: Path, graphs_dir: Path) -> Non
 
     data = lk.read(source_dir / filename)
     if kind == "tp":
-        data = data.to_lightcurve(aperture_mask="all")
-    lightcurve = data.remove_nans().flatten()
+        data = data.to_lightcurve(aperture_mask=aperture_mask)
+    lightcurve = data.remove_nans().flatten(window_length=window_length)
 
     fig, ax = plt.subplots()
     try:
@@ -333,14 +347,27 @@ class Project:
 
     # -- stage 2: process --------------------------------------------------- #
     @needs_project
-    def process(self, amount: int, workers: int = 1) -> None:
-        """Plot the first `amount` downloaded files (raise `workers` to use more CPU cores)."""
+    def process(self, amount: int, workers: int = 1,
+                window_length: int = DEFAULT_WINDOW_LENGTH,
+                aperture_mask: str = DEFAULT_APERTURE_MASK) -> None:
+        """Plot the first `amount` downloaded files.
+
+        workers:       CPU cores to use (1 = run in this process).
+        window_length: odd number of data points in flatten()'s smoothing window. Use a window
+                       several times longer than the transits you are looking for.
+        aperture_mask: how target pixel ("tp") files become light curves: "all", "pipeline"
+                       or "threshold". Ignored for light curve ("lc") files.
+
+        Files that already have a plot are skipped, so new settings only affect new files.
+        """
+        _check_window_length(window_length)
         files = self.state.downloaded[:amount]
         done = set(self.state.processed)
         pending = [name for name in files if image_name(name) not in done]
         job = partial(_render, kind=self.state.kind,
                       source_dir=self.root / KIND_DIRS.get(self.state.kind, ""),
-                      graphs_dir=self.root / GRAPHS_DIR)
+                      graphs_dir=self.root / GRAPHS_DIR,
+                      window_length=window_length, aperture_mask=aperture_mask)
 
         self._run_stage(job, pending, total=len(files), workers=workers,
                         executor_cls=ProcessPoolExecutor,  # plotting is CPU-bound
@@ -348,10 +375,14 @@ class Project:
                         record=image_name)
 
     @needs_project
-    def indprocess(self, filename: str) -> str:
-        """Plot a single downloaded file and return the image name."""
+    def indprocess(self, filename: str,
+                   window_length: int = DEFAULT_WINDOW_LENGTH,
+                   aperture_mask: str = DEFAULT_APERTURE_MASK) -> str:
+        """Plot a single downloaded file (same settings as process()) and return the image name."""
+        _check_window_length(window_length)
         _render(filename, self.state.kind,
-                self.root / KIND_DIRS[self.state.kind], self.root / GRAPHS_DIR)
+                self.root / KIND_DIRS[self.state.kind], self.root / GRAPHS_DIR,
+                window_length=window_length, aperture_mask=aperture_mask)
         return image_name(filename)
 
     # -- stage 3: review ---------------------------------------------------- #
